@@ -1,15 +1,18 @@
 services:
   ysp-live:
-    build: .
-    image: ysp-live:v7.3
+    image: ghcr.io/evanzme/ysp-live:latest
     container_name: ysp-live
     restart: unless-stopped
-    ports:
-      - "8767:8767"
+    # host 模式直接使用宿主机网络，程序监听 8767
+    network_mode: host
     volumes:
       - ./data:/app/data
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
-    # Linux / 群晖 / 软路由 NAS 推荐启用 host 模式（取消下一行注释并注释掉上方 ports）以获得极致 4K 吞吐：
-    # network_mode: host
+      # 每个设备获取几个 4K 链接后主动换新设备 (出现 HTTP 400 时可改为 3)
+      - YSP_LINKS_PER_DEVICE=4
+      # 设备被封后连续失败几次换新设备 (兜底)
+      - YSP_IDENTITY_RESET_THRESHOLD=3
+      # 走 4K/高码率接口的频道，逗号分隔；不设置则为全部 26 个
+      # - YSP_HIGHRATE_CHANNELS=cctv4k,cctv8k,cctv164k,cctv5,cctv5p

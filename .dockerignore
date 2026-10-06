@@ -1,0 +1,5 @@
+.git
+.github
+data
+*.md
+docker-compose.yml
