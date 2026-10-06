@@ -387,6 +387,10 @@ def is_identity_recoverable_error(message: str) -> bool:
     lower = message.lower()
     return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower) or ('vdn did not return final url' in lower)
 
+def is_device_blocked_error(message: str) -> bool:
+    lower = message.lower()
+    return 'live/v1/01 http 400' in lower or 'vdn did not return final url' in lower
+
 def normalize_channel(raw: str) -> str:
     key = raw.strip().strip('/').lower()
     if key.endswith('.m3u8'):
@@ -939,6 +943,7 @@ class ResolverState:
         self.last_identity_reset_at = 0.0
         self.last_identity_reset_reason = ''
         self.ad_display = False
+        self.last_device_rotate_at = 0.0
 
 @dataclasses.dataclass
 class AppSession:
@@ -1313,6 +1318,7 @@ class Resolver:
             self.state.generation += 1
             generation = self.state.generation
         log_program_fetching()
+        app_session = None
         try:
             app_session = self.get_app_session_controlled()
             live_id = channel_by_name(channel)
@@ -1325,6 +1331,18 @@ class Resolver:
                 self.state.refreshing_channel = ''
                 if is_session_invalidating_error(str(err)):
                     self.state.app_session = None
+                # 设备被风控 (live/v1/01 400 或 VDN 内部错误) 时立即换设备，不等累计阈值；
+                # 新注册的设备也可能一开始就不可用，同样适用。限制 10 秒内最多换一次，避免反复切换
+                blocked = (
+                    app_session is not None
+                    and is_device_blocked_error(str(err))
+                    and now_f64() - self.state.last_device_rotate_at >= 10.0
+                )
+                if blocked:
+                    self.state.app_session = None
+                    self.state.last_device_rotate_at = now_f64()
+            if blocked:
+                self.rotate_device(app_session, f'请求被拒 ({str(err)[:60]})')
             raise
         with self.state_lock:
             self.state.last_business_end_at = now_f64()
@@ -1340,19 +1358,20 @@ class Resolver:
                 app_session.links_obtained += 1
                 if app_session.links_obtained >= LINKS_PER_DEVICE:
                     self.state.app_session = None
+                    self.state.last_device_rotate_at = now_f64()
                     rotate = True
         if rotate:
-            self.rotate_device(app_session)
+            self.rotate_device(app_session, f'已获取 {app_session.links_obtained} 个 4K 链接')
         return entry
 
-    def rotate_device(self, old: AppSession) -> None:
+    def rotate_device(self, old: AppSession, reason: str) -> None:
         # 单设备获取 4K 链接数有上限，超过会被风控 (live/v1/01 HTTP 400)，因此主动换新设备。
         # 已缓存的链接自带旧设备的签名头，在过期前仍可继续播放。
         try:
             os.remove(self.args.device_json)
         except OSError:
             pass
-        log(f'设备 {old.cast_model} 已获取 {old.links_obtained} 个 4K 链接，主动更换新设备')
+        log(f'设备 {old.cast_model} {reason}，主动更换新设备')
 
         def prewarm():
             try:
