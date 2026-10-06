@@ -385,7 +385,7 @@ def is_session_invalidating_error(message: str) -> bool:
 
 def is_identity_recoverable_error(message: str) -> bool:
     lower = message.lower()
-    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower)
+    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower) or ('vdn did not return final url' in lower)
 
 def normalize_channel(raw: str) -> str:
     key = raw.strip().strip('/').lower()
@@ -2960,6 +2960,12 @@ def main():
             data_dir = here
     engine_args = argparse.Namespace(host=args.bind, port=args.port, timeout=15.0, insecure_tls=False, cache_ttl=600.0, stale_while_refresh_ttl=120.0, refresh_error_cooldown=30.0, playlist_cache_ttl=0.0, background_refresh_queue_limit=4, http_workers=16, http_queue_limit=1000, identity_reset_error_threshold=int(os.environ.get('YSP_IDENTITY_RESET_THRESHOLD', '3')), identity_reset_cooldown=300.0, refresh_interval=1.0, control_step_jitter_min_ms=0, control_step_jitter_max_ms=0, heartbeat_interval=30.0, heartbeat_ttl_guard=60.0, session_ttl=7200.0, meta_json=os.path.join(data_dir, 'proxy-cache-state-rs.json'), device_json=os.path.join(data_dir, 'device-state-rs.json'))
     resolve_paths(engine_args)
+    # 已获取链接数只记在内存里，重启后无法得知旧设备还剩多少额度，因此每次启动都换新设备
+    if LINKS_PER_DEVICE > 0:
+        try:
+            os.remove(engine_args.device_json)
+        except OSError:
+            pass
     resolver = Resolver(engine_args)
     if not args.no_4k:
         resolver.start_heartbeat()
