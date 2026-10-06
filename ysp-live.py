@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
-__version__ = '7.3.0'
+__version__ = '8.0.0'
 AK = '9f5c54c4ed0e50109b800f7e28fec205'
 RSA_PUBLIC_KEY_B64 = 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkKeLy4ywWLSnBkwRyqYgF3HMIj05V5uuh5HjyEsZOWnu1NHu3jPQv3sr32wwQNYv5qapsNXmNgLUDHtgHZxqPQAYXltjSRc0qhcD286t62wOIHId8zXS3s1Jy4rgU4qjQWzI9rp/1sE0pMsmwTaJa4zuJ5iz8VwF8Av5oJ1k+HxY+/HLnjNlW1hmWLpuDYmkZYuAoTHa1VGeHQh9FEKI8ZcL3GTQphShUoC+Kg3P1hGUVTtCYapmzPS5lkAdwebuzwvTCfGiTErYZCnPBUSeV7BVlgjtLYIi29KvF0a8FHsJMfe/UdHcyW/RihsIYOtDQcRRpFGXyPXbVrzFJse24QIDAQAB'
 CLOUD_GET_URL = 'https://ytpcloudws.cctv.cn/cloudps/wssapi/device/v2/get'
@@ -385,11 +385,7 @@ def is_session_invalidating_error(message: str) -> bool:
 
 def is_identity_recoverable_error(message: str) -> bool:
     lower = message.lower()
-    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower) or ('vdn did not return final url' in lower)
-
-def is_device_blocked_error(message: str) -> bool:
-    lower = message.lower()
-    return 'live/v1/01 http 400' in lower or 'vdn did not return final url' in lower
+    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower)
 
 def normalize_channel(raw: str) -> str:
     key = raw.strip().strip('/').lower()
@@ -581,11 +577,14 @@ def load_device_state(path: str):
     return (state, True)
 
 def save_device_state(path: str, state: DeviceState) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(dataclasses.asdict(state), indent=2, ensure_ascii=False, sort_keys=True) + '\n')
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(dataclasses.asdict(state), indent=2, ensure_ascii=False, sort_keys=True) + '\n')
+    except OSError:
+        pass
 
 def infer_os_version(profile: DeviceProfile) -> str:
     if ':' in profile.fingerprint:
@@ -943,7 +942,6 @@ class ResolverState:
         self.last_identity_reset_at = 0.0
         self.last_identity_reset_reason = ''
         self.ad_display = False
-        self.last_device_rotate_at = 0.0
 
 @dataclasses.dataclass
 class AppSession:
@@ -961,7 +959,6 @@ class AppSession:
     heartbeat_count: int
     last_heartbeat_result: str
     last_heartbeat_error: str
-    links_obtained: int = 0
 
 class RefreshQueue:
 
@@ -1149,13 +1146,6 @@ class Resolver:
             self.state.identity_reset_error_count = 0
 
     def reset_identity_and_cache(self, reason: str):
-        # 删除设备与缓存文件，下次 bootstrap 生成全新设备身份（被风控的身份重用无意义）
-        for path in (self.args.device_json, self.args.meta_json):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        log(f'设备身份已重置: {reason[:120]}')
         with self.state_lock:
             self.state.cache.clear()
             self.state.playlist_cache.clear()
@@ -1318,7 +1308,6 @@ class Resolver:
             self.state.generation += 1
             generation = self.state.generation
         log_program_fetching()
-        app_session = None
         try:
             app_session = self.get_app_session_controlled()
             live_id = channel_by_name(channel)
@@ -1331,18 +1320,6 @@ class Resolver:
                 self.state.refreshing_channel = ''
                 if is_session_invalidating_error(str(err)):
                     self.state.app_session = None
-                # 设备被风控 (live/v1/01 400 或 VDN 内部错误) 时立即换设备，不等累计阈值；
-                # 新注册的设备也可能一开始就不可用，同样适用。限制 10 秒内最多换一次，避免反复切换
-                blocked = (
-                    app_session is not None
-                    and is_device_blocked_error(str(err))
-                    and now_f64() - self.state.last_device_rotate_at >= 10.0
-                )
-                if blocked:
-                    self.state.app_session = None
-                    self.state.last_device_rotate_at = now_f64()
-            if blocked:
-                self.rotate_device(app_session, f'请求被拒 ({str(err)[:60]})')
             raise
         with self.state_lock:
             self.state.last_business_end_at = now_f64()
@@ -1353,33 +1330,7 @@ class Resolver:
             self.state.identity_reset_error_count = 0
             self.state.last_error = ''
             log_channel_ready(channel)
-            rotate = False
-            if LINKS_PER_DEVICE > 0 and app_session is self.state.app_session:
-                app_session.links_obtained += 1
-                if app_session.links_obtained >= LINKS_PER_DEVICE:
-                    self.state.app_session = None
-                    self.state.last_device_rotate_at = now_f64()
-                    rotate = True
-        if rotate:
-            self.rotate_device(app_session, f'已获取 {app_session.links_obtained} 个 4K 链接')
         return entry
-
-    def rotate_device(self, old: AppSession, reason: str) -> None:
-        # 单设备获取 4K 链接数有上限，超过会被风控 (live/v1/01 HTTP 400)，因此主动换新设备。
-        # 已缓存的链接自带旧设备的签名头，在过期前仍可继续播放。
-        try:
-            os.remove(self.args.device_json)
-        except OSError:
-            pass
-        log(f'设备 {old.cast_model} {reason}，主动更换新设备')
-
-        def prewarm():
-            try:
-                sess = self.ensure_fresh_session()
-                log(f'新设备 {sess.cast_model} 已就绪')
-            except Exception as e:
-                log(f'新设备预注册失败: {e} (下次请求时重试)')
-        threading.Thread(target=prewarm, daemon=True, name='device-rotate').start()
 
     def ensure_fresh_session(self) -> AppSession:
         with self.state_lock:
@@ -1901,17 +1852,20 @@ class Resolver:
         return {'channels': [c for c, _ in channels()], 'cache_ttl_seconds': float(self.args.cache_ttl), 'stale_while_refresh_ttl_seconds': float(self.args.stale_while_refresh_ttl), 'refresh_error_cooldown_seconds': float(self.args.refresh_error_cooldown), 'playlist_cache_ttl_seconds': float(self.args.playlist_cache_ttl), 'background_refresh_queue_limit': int(self.args.background_refresh_queue_limit), 'http_workers': max(1, int(self.args.http_workers)), 'http_queue_limit': int(self.args.http_queue_limit), 'identity_reset_error_threshold': int(self.args.identity_reset_error_threshold), 'identity_reset_cooldown_seconds': float(self.args.identity_reset_cooldown), 'refresh_interval_seconds': float(self.args.refresh_interval), 'control_step_jitter_min_ms': int(self.args.control_step_jitter_min_ms), 'control_step_jitter_max_ms': int(self.args.control_step_jitter_max_ms), 'heartbeat_interval_seconds': float(self.args.heartbeat_interval), 'heartbeat_ttl_guard_seconds': float(self.args.heartbeat_ttl_guard), 'session_ttl_seconds': float(self.args.session_ttl), 'meta_json': self.args.meta_json, 'device_json': self.args.device_json, 'device_state': device_state, 'refreshing_channel': state_snapshot['refreshing_channel'], 'background_refreshing': list(state_snapshot['background_refreshing'].keys()), 'background_refresh_queue': refresh_queue, 'http_queue': http_queue, 'generation': state_snapshot['generation'], 'app_session': app_session, 'last_business_end_at': state_snapshot['last_business_end_at'], 'last_error': state_snapshot['last_error'], 'identity_reset_error_count': state_snapshot['identity_reset_error_count'], 'identity_reset_count': state_snapshot['identity_reset_count'], 'last_identity_reset_at': state_snapshot['last_identity_reset_at'], 'last_identity_reset_reason': state_snapshot['last_identity_reset_reason'], 'ad_display': state_snapshot['ad_display'], 'device_profile_pool_size': len(DEVICE_PROFILE_POOL), 'cache': cache, 'playlist_cache': playlist_cache}
 
     def write_meta(self) -> None:
-        payload = self.status_json()
-        with self.state_lock:
-            cache_detail = {k: dataclasses.asdict(v) for k, v in self.state.cache.items()}
-        payload['cache_detail'] = cache_detail
-        payload['session_detail_note'] = 'Session secrets are intentionally not persisted for reuse; Python process keeps live session in memory only.'
-        payload['device_state_note'] = 'Randomized TV device identity is persisted in device-state-rs.json after cloud registration succeeds; a new identity reset creates a new profile and MAC.'
-        parent = os.path.dirname(os.path.abspath(self.args.meta_json))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(self.args.meta_json, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + '\n')
+        try:
+            payload = self.status_json()
+            with self.state_lock:
+                cache_detail = {k: dataclasses.asdict(v) for k, v in self.state.cache.items()}
+            payload['cache_detail'] = cache_detail
+            payload['session_detail_note'] = 'Session secrets are intentionally not persisted for reuse; Python process keeps live session in memory only.'
+            payload['device_state_note'] = 'Randomized TV device identity is persisted in device-state-rs.json after cloud registration succeeds; a new identity reset creates a new profile and MAC.'
+            parent = os.path.dirname(os.path.abspath(self.args.meta_json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.args.meta_json, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + '\n')
+        except OSError:
+            pass
 
 def load_cache(path: str) -> dict:
     try:
@@ -2425,8 +2379,107 @@ def fetch_abs_playlist(url, depth=0):
         else:
             out.append(ln)
     return '\n'.join(out)
-CHANNELS = [('cctv1', 'CCTV-1 综合', '2024078201', '600001859', 'fhd'), ('cctv2', 'CCTV-2 财经', '2024075401', '600001800', 'fhd'), ('cctv3', 'CCTV-3 综艺', '2024068501', '600001801', 'fhd'), ('cctv4', 'CCTV-4 中文国际', '2029797101', '600001814', 'fhd'), ('cctv5', 'CCTV-5 体育', '2024078401', '600001818', 'fhd'), ('cctv5p', 'CCTV-5+ 体育赛事', '2024078001', '600001817', 'fhd'), ('cctv6', 'CCTV-6 电影', '2013693901', '600108442', 'fhd'), ('cctv7', 'CCTV-7 国防军事', '2024072001', '600004092', 'fhd'), ('cctv8', 'CCTV-8 电视剧', '2029793001', '600001803', 'fhd'), ('cctv9', 'CCTV-9 纪录', '2024078601', '600004078', 'fhd'), ('cctv10', 'CCTV-10 科教', '2024078701', '600001805', 'fhd'), ('cctv11', 'CCTV-11 戏曲', '2027248701', '600001806', 'fhd'), ('cctv12', 'CCTV-12 社会与法', '2027248801', '600001807', 'fhd'), ('cctv13', 'CCTV-13 新闻', '2029797201', '600001811', 'fhd'), ('cctv14', 'CCTV-14 少儿', '2027248901', '600001809', 'fhd'), ('cctv15', 'CCTV-15 音乐', '2027249001', '600001815', 'fhd'), ('cctv16', 'CCTV-16 奥林匹克', '2027249101', '600098637', 'fhd'), ('cctv164k', 'CCTV-16 4K', '2027249301', '600099502', 'fhd'), ('cctv17', 'CCTV-17 农业农村', '2027249401', '600001810', 'fhd'), ('cctv4k', 'CCTV-4K 超高清', '2029810301', '600002264', 'fhd'), ('cctv8k', 'CCTV-8K 超高清', '2026774101', '600156816', 'fhd'), ('cgtn', 'CGTN', '2024181701', '600014550', 'fhd'), ('cgtnfr', 'CGTN 法语', '2024181801', '600084704', 'fhd'), ('cgtnru', 'CGTN 俄语', '2024181901', '600084758', 'fhd'), ('cgtnar', 'CGTN 阿拉伯语', '2024182001', '600084782', 'fhd'), ('cgtnes', 'CGTN 西班牙语', '2024182101', '600084744', 'fhd'), ('cgtndoc', 'CGTN 纪录', '2024182301', '600084781', 'fhd'), ('cctvfyjc', 'CCTV 风云剧场', '2025637103', '600099658', 'shd'), ('cctvdyjc', 'CCTV 第一剧场', '2026874203', '600099655', 'shd'), ('cctvhjjc', 'CCTV 怀旧剧场', '2026874303', '600099620', 'shd'), ('bjws', '北京卫视', '2024052703', '600002309', 'fhd'), ('jsws', '江苏卫视', '2024171103', '600002521', 'fhd'), ('dfws', '东方卫视', '2024054503', '600002483', 'fhd'), ('zjws', '浙江卫视', '2024054703', '600002520', 'fhd'), ('hnws', '湖南卫视', '2024054803', '600002475', 'fhd'), ('hbws', '湖北卫视', '2024171203', '600002508', 'fhd'), ('gdws', '广东卫视', '2024060903', '600002485', 'fhd'), ('gxws', '广西卫视', '2024060703', '600002509', 'fhd'), ('hljws', '黑龙江卫视', '2029797003', '600002498', 'fhd'), ('hainanws', '海南卫视', '2024055603', '600002506', 'fhd'), ('cqws', '重庆卫视', '2024061103', '600002531', 'fhd'), ('szws', '深圳卫视', '2024061303', '600002481', 'fhd'), ('scws', '四川卫视', '2024061403', '600002516', 'fhd'), ('henanws', '河南卫视', '2029797303', '600002525', 'fhd'), ('dnws', '东南卫视', '2024061503', '600002484', 'fhd'), ('gzws', '贵州卫视', '2024061603', '600002490', 'fhd'), ('jxws', '江西卫视', '2024061703', '600002503', 'fhd'), ('lnws', '辽宁卫视', '2024171303', '600002505', 'fhd'), ('ahws', '安徽卫视', '2024171403', '600002532', 'fhd'), ('hebws', '河北卫视', '2024171503', '600002493', 'fhd'), ('sdws', '山东卫视', '2029787903', '600002513', 'fhd'), ('tjws', '天津卫视', '2019927003', '600152137', 'fhd'), ('jlws', '吉林卫视', '2025561503', '600190405', 'fhd'), ('saxws', '陕西卫视', '2029795103', '600190400', 'fhd'), ('nxws', '宁夏卫视', '2025608503', '600190737', 'fhd'), ('nmgws', '内蒙古卫视', '2025561203', '600190401', 'fhd'), ('ynws', '云南卫视', '2025561303', '600190402', 'fhd'), ('shanxiws', '山西卫视', '2025560803', '600190407', 'fhd'), ('gsws', '甘肃卫视', '2025561703', '600190408', 'fhd'), ('qhws', '青海卫视', '2025559103', '600190406', 'fhd'), ('xizangws', '西藏卫视', '2025558003', '600190403', 'fhd'), ('xjws', '新疆卫视', '2019927403', '600152138', 'fhd'), ('cetv1', 'CETV-1', '2022823801', '600171827', 'fhd'), ('guoxue', '国学频道', '2029360403', '600213139', 'fhd')]
-TVG_IDS = {'cctv1': 'CCTV1', 'cctv2': 'CCTV2', 'cctv3': 'CCTV3', 'cctv4': 'CCTV4', 'cctv5': 'CCTV5', 'cctv5p': 'CCTV5+', 'cctv6': 'CCTV6', 'cctv7': 'CCTV7', 'cctv8': 'CCTV8', 'cctv9': 'CCTV9', 'cctv10': 'CCTV10', 'cctv11': 'CCTV11', 'cctv12': 'CCTV12', 'cctv13': 'CCTV13', 'cctv14': 'CCTV14', 'cctv15': 'CCTV15', 'cctv16': 'CCTV16', 'cctv164k': 'CCTV16', 'cctv17': 'CCTV17', 'cctv4k': 'CCTV4K', 'cctv8k': 'CCTV-8K', 'cgtn': 'CGTN英语', 'cgtnfr': 'CGTN法语', 'cgtnru': 'CGTN俄语', 'cgtnar': 'CGTN阿语', 'cgtnes': 'CGTN西语', 'cgtndoc': 'CGTN纪录', 'cctvdyjc': 'CCTV第一剧场', 'cctvfyjc': 'CCTV风云剧场', 'cctvhjjc': 'CCTV怀旧剧场', 'cetv1': 'CETV1', 'bjws': '北京卫视', 'jsws': '江苏卫视', 'dfws': '东方卫视', 'zjws': '浙江卫视', 'hnws': '湖南卫视', 'hbws': '湖北卫视', 'gdws': '广东卫视', 'gxws': '广西卫视', 'hljws': '黑龙江卫视', 'hainanws': '海南卫视', 'cqws': '重庆卫视', 'szws': '深圳卫视', 'scws': '四川卫视', 'henanws': '河南卫视', 'dnws': '东南卫视', 'gzws': '贵州卫视', 'jxws': '江西卫视', 'lnws': '辽宁卫视', 'ahws': '安徽卫视', 'hebws': '河北卫视', 'sdws': '山东卫视', 'tjws': '天津卫视', 'jlws': '吉林卫视', 'saxws': '陕西卫视', 'nxws': '宁夏卫视', 'nmgws': '内蒙古卫视', 'ynws': '云南卫视', 'shanxiws': '山西卫视', 'qhws': '青海卫视', 'xizangws': '西藏卫视', 'xjws': '新疆卫视', 'gsws': '甘肃卫视', 'guoxue': '国学'}
+
+DEFAULT_CHANNELS = [
+    ('cctv1', 'CCTV-1 综合', '2024078201', '600001859', 'fhd'),
+    ('cctv2', 'CCTV-2 财经', '2024075401', '600001800', 'fhd'),
+    ('cctv3', 'CCTV-3 综艺', '2024068501', '600001801', 'fhd'),
+    ('cctv4', 'CCTV-4 中文国际', '2029797101', '600001814', 'fhd'),
+    ('cctv5', 'CCTV-5 体育', '2024078401', '600001818', 'fhd'),
+    ('cctv5p', 'CCTV-5+ 体育赛事', '2024078001', '600001817', 'fhd'),
+    ('cctv6', 'CCTV-6 电影', '2013693901', '600108442', 'fhd'),
+    ('cctv7', 'CCTV-7 国防军事', '2024072001', '600004092', 'fhd'),
+    ('cctv8', 'CCTV-8 电视剧', '2029793001', '600001803', 'fhd'),
+    ('cctv9', 'CCTV-9 纪录', '2024078601', '600004078', 'fhd'),
+    ('cctv10', 'CCTV-10 科教', '2024078701', '600001805', 'fhd'),
+    ('cctv11', 'CCTV-11 戏曲', '2027248701', '600001806', 'fhd'),
+    ('cctv12', 'CCTV-12 社会与法', '2027248801', '600001807', 'fhd'),
+    ('cctv13', 'CCTV-13 新闻', '2029797201', '600001811', 'fhd'),
+    ('cctv14', 'CCTV-14 少儿', '2027248901', '600001809', 'fhd'),
+    ('cctv15', 'CCTV-15 音乐', '2027249001', '600001815', 'fhd'),
+    ('cctv16', 'CCTV-16 奥林匹克', '2027249101', '600098637', 'fhd'),
+    ('cctv164k', 'CCTV-16 4K', '2027249301', '600099502', 'fhd'),
+    ('cctv17', 'CCTV-17 农业农村', '2027249401', '600001810', 'fhd'),
+    ('cctv4k', 'CCTV-4K 超高清', '2029810301', '600002264', 'fhd'),
+    ('cctv8k', 'CCTV-8K 超高清', '2026774101', '600156816', 'fhd'),
+    ('cgtn', 'CGTN', '2024181701', '600014550', 'fhd'),
+    ('cgtnfr', 'CGTN 法语', '2024181801', '600084704', 'fhd'),
+    ('cgtnru', 'CGTN 俄语', '2024181901', '600084758', 'fhd'),
+    ('cgtnar', 'CGTN 阿拉伯语', '2024182001', '600084782', 'fhd'),
+    ('cgtnes', 'CGTN 西班牙语', '2024182101', '600084744', 'fhd'),
+    ('cgtndoc', 'CGTN 纪录', '2024182301', '600084781', 'fhd'),
+    ('cctvfyjc', 'CCTV 风云剧场', '2025637102', '600099658', 'shd'),
+    ('cctvdyjc', 'CCTV 第一剧场', '2026874202', '600099655', 'shd'),
+    ('cctvhjjc', 'CCTV 怀旧剧场', '2026874302', '600099620', 'shd'),
+    ('bjws', '北京卫视', '2024052703', '600002309', 'fhd'),
+    ('jsws', '江苏卫视', '2024171103', '600002521', 'fhd'),
+    ('dfws', '东方卫视', '2024054503', '600002483', 'fhd'),
+    ('zjws', '浙江卫视', '2024054703', '600002520', 'fhd'),
+    ('hnws', '湖南卫视', '2024054803', '600002475', 'fhd'),
+    ('hbws', '湖北卫视', '2024171203', '600002508', 'fhd'),
+    ('gdws', '广东卫视', '2024060903', '600002485', 'fhd'),
+    ('gxws', '广西卫视', '2024060703', '600002509', 'fhd'),
+    ('hljws', '黑龙江卫视', '2029797003', '600002498', 'fhd'),
+    ('hainanws', '海南卫视', '2024055603', '600002506', 'fhd'),
+    ('cqws', '重庆卫视', '2024061103', '600002531', 'fhd'),
+    ('szws', '深圳卫视', '2024061303', '600002481', 'fhd'),
+    ('scws', '四川卫视', '2024061403', '600002516', 'fhd'),
+    ('henanws', '河南卫视', '2029797303', '600002525', 'fhd'),
+    ('dnws', '东南卫视', '2024061503', '600002484', 'fhd'),
+    ('gzws', '贵州卫视', '2024061603', '600002490', 'fhd'),
+    ('jxws', '江西卫视', '2024061703', '600002503', 'fhd'),
+    ('lnws', '辽宁卫视', '2024171303', '600002505', 'fhd'),
+    ('ahws', '安徽卫视', '2024171403', '600002532', 'fhd'),
+    ('hebws', '河北卫视', '2024171503', '600002493', 'fhd'),
+    ('sdws', '山东卫视', '2029787903', '600002513', 'fhd'),
+    ('tjws', '天津卫视', '2019927003', '600152137', 'fhd'),
+    ('jlws', '吉林卫视', '2025561503', '600190405', 'fhd'),
+    ('saxws', '陕西卫视', '2029795103', '600190400', 'fhd'),
+    ('nxws', '宁夏卫视', '2025608503', '600190737', 'fhd'),
+    ('nmgws', '内蒙古卫视', '2025561203', '600190401', 'fhd'),
+    ('ynws', '云南卫视', '2025561303', '600190402', 'fhd'),
+    ('shanxiws', '山西卫视', '2025560803', '600190407', 'fhd'),
+    ('gsws', '甘肃卫视', '2025561703', '600190408', 'fhd'),
+    ('qhws', '青海卫视', '2025559103', '600190406', 'fhd'),
+    ('xizangws', '西藏卫视', '2025558003', '600190403', 'fhd'),
+    ('xjws', '新疆卫视', '2019927403', '600152138', 'fhd'),
+    ('cetv1', 'CETV-1', '2022823801', '600171827', 'fhd'),
+    ('guoxue', '国学频道', '2029360403', '600213139', 'fhd')
+]
+
+ALIAS_MAP = {
+    'anhuiws': 'ahws', 'beijingws': 'bjws', 'cctv16hd': 'cctv16', 'cctv5plus': 'cctv5p',
+    'cctvdiyijuchang': 'cctvdyjc', 'cctvfengyunjuchang': 'cctvfyjc', 'cctvhuaijiujuchang': 'cctvhjjc',
+    'cgtnalaboyu': 'cgtnar', 'cgtneyu': 'cgtnru', 'cgtnfayu': 'cgtnfr', 'cgtnwaiyujilu': 'cgtndoc',
+    'cgtnxibanyayu': 'cgtnes', 'chongqingws': 'cqws', 'dongfangws': 'dfws', 'fujiandongnanws': 'dnws',
+    'guangdongws': 'gdws', 'guangxiws': 'gxws', 'guizhouws': 'gzws', 'hebeiws': 'hebws',
+    'heilongjiangws': 'hljws', 'hubeiws': 'hbws', 'hunanws': 'hnws', 'jiangsuws': 'jsws',
+    'jiangxiws': 'jxws', 'jilinws': 'jlws', 'liaoningws': 'lnws', 'neimengguws': 'nmgws',
+    'ningxiaws': 'nxws', 'qinghaiws': 'qhws', 'shandongws': 'sdws', 'shannxiws': 'saxws',
+    'shenzhenws': 'szws', 'sichuanws': 'scws', 'tianjinws': 'tjws', 'xinjiangws': 'xjws',
+    'yunnanws': 'ynws', 'zhejiangws': 'zjws'
+}
+
+TVG_IDS = {
+    'cctv1': 'CCTV1', 'cctv2': 'CCTV2', 'cctv3': 'CCTV3', 'cctv4': 'CCTV4',
+    'cctv5': 'CCTV5', 'cctv5p': 'CCTV5+', 'cctv6': 'CCTV6', 'cctv7': 'CCTV7',
+    'cctv8': 'CCTV8', 'cctv9': 'CCTV9', 'cctv10': 'CCTV10', 'cctv11': 'CCTV11',
+    'cctv12': 'CCTV12', 'cctv13': 'CCTV13', 'cctv14': 'CCTV14', 'cctv15': 'CCTV15',
+    'cctv16': 'CCTV16', 'cctv164k': 'CCTV16', 'cctv17': 'CCTV17', 'cctv4k': 'CCTV4K',
+    'cctv8k': 'CCTV-8K', 'cgtn': 'CGTN英语', 'cgtnfr': 'CGTN法语', 'cgtnru': 'CGTN俄语',
+    'cgtnar': 'CGTN阿语', 'cgtnes': 'CGTN西语', 'cgtndoc': 'CGTN纪录',
+    'cctvdyjc': 'CCTV第一剧场', 'cctvfyjc': 'CCTV风云剧场', 'cctvhjjc': 'CCTV怀旧剧场',
+    'cetv1': 'CETV1', 'bjws': '北京卫视', 'jsws': '江苏卫视', 'dfws': '东方卫视',
+    'zjws': '浙江卫视', 'hnws': '湖南卫视', 'hbws': '湖北卫视', 'gdws': '广东卫视',
+    'gxws': '广西卫视', 'hljws': '黑龙江卫视', 'hainanws': '海南卫视', 'cqws': '重庆卫视',
+    'szws': '深圳卫视', 'scws': '四川卫视', 'henanws': '河南卫视', 'dnws': '东南卫视',
+    'gzws': '贵州卫视', 'jxws': '江西卫视', 'lnws': '辽宁卫视', 'ahws': '安徽卫视',
+    'hebws': '河北卫视', 'sdws': '山东卫视', 'tjws': '天津卫视', 'jlws': '吉林卫视',
+    'saxws': '陕西卫视', 'nxws': '宁夏卫视', 'nmgws': '内蒙古卫视', 'ynws': '云南卫视',
+    'shanxiws': '山西卫视', 'qhws': '青海卫视', 'xizangws': '西藏卫视', 'xjws': '新疆卫视',
+    'gsws': '甘肃卫视', 'guoxue': '国学'
+}
+
 LOGO_BASE = 'https://garysclub.sharewithyou.dpdns.org/logos/ysp-live-logos'
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 REFRESH_INTERVAL = 10
@@ -2434,15 +2487,17 @@ IDLE_TIMEOUT = 120
 WINDOW = 300
 MAX_SEGS = 120
 BK_URL_TTL = 300
-# 走 live/v1/01 高码率接口的频道，其余频道走 1080p (jce/bk)。单设备获取过多会被风控，见 LINKS_PER_DEVICE
-BACKEND_CHANNELS = {c.strip() for c in os.environ.get('YSP_HIGHRATE_CHANNELS', 'cctv1,cctv2,cctv3,cctv4,cctv5,cctv5p,cctv7,cctv8,cctv9,cctv10,cctv11,cctv12,cctv13,cctv14,cctv15,cctv16,cctv17,cctv4k,cctv8k,cctv164k,cgtn,cgtnfr,cgtnru,cgtnar,cgtnes,cgtndoc').split(',') if c.strip()}
-TRUE_4K_CHANNELS = {'cctv4k', 'cctv8k', 'cctv164k'}
-# 每个设备获取多少个 4K 链接后主动换设备，0 表示不主动更换
-LINKS_PER_DEVICE = int(os.environ.get('YSP_LINKS_PER_DEVICE', '4'))
 
+BACKEND_CHANNELS = {
+    'cctv1', 'cctv2', 'cctv3', 'cctv4', 'cctv5', 'cctv5p', 'cctv7', 'cctv8',
+    'cctv9', 'cctv10', 'cctv11', 'cctv12', 'cctv13', 'cctv14', 'cctv15',
+    'cctv16', 'cctv17', 'cctv4k', 'cctv8k', 'cctv164k', 'cgtn', 'cgtnfr',
+    'cgtnru', 'cgtnar', 'cgtnes', 'cgtndoc'
+}
+TRUE_4K_CHANNELS = {'cctv4k', 'cctv8k', 'cctv164k'}
 
 TIMESHIFT_SUPPORTED = {
-    "cctv1", "cctv2", "cctv3", "cctv4", "cctv5", "cctv5p", "cctv6", "cctv7", "cctv8", "cctv9", "cctv10", "cctv13",
+    "cctv1", "cctv2", "cctv3", "cctv4", "cctv5", "cctv5p", "cctv6", "cctv7", "cctv8", "cctv9", "cctv10", "cctv13", "cctv8k",
     "cgtn", "cgtnfr", "cgtnru", "cgtnar", "cgtnes", "cgtndoc", "cetv1", "guoxue",
     "bjws", "jsws", "dfws", "zjws", "hnws", "hbws", "gdws", "gxws",
     "hljws", "hainanws", "cqws", "szws", "scws", "henanws", "dnws",
@@ -2451,11 +2506,10 @@ TIMESHIFT_SUPPORTED = {
 }
 
 def get_channel_group(slug: str) -> str:
-    if slug.endswith("ws"):
-        return "卫视频道"
-    if "jc" in slug or slug == "guoxue":
-        return "数字频道"
-    return "央视频道"
+    s = ALIAS_MAP.get(slug.lower(), slug.lower())
+    if s.startswith("cctv") or s.startswith("cgtn"):
+        return "央视"
+    return "卫视"
 
 def parse_catchup_time_val(val_str: str | None) -> int | None:
     if not val_str:
@@ -2518,8 +2572,219 @@ def parse_catchup_query(query_str: str) -> tuple[int, int] | None:
         return start_ts, end_ts
     return None
 
-class Channel:
+_inflight_refresh: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
 
+def coalesce_refresh(slug: str, refresh_fn):
+    with _inflight_lock:
+        if slug in _inflight_refresh:
+            ev = _inflight_refresh[slug]
+            wait = True
+        else:
+            ev = threading.Event()
+            _inflight_refresh[slug] = ev
+            wait = False
+    if wait:
+        ev.wait(timeout=6.0)
+        return
+    try:
+        refresh_fn()
+    finally:
+        with _inflight_lock:
+            _inflight_refresh.pop(slug, None)
+        ev.set()
+
+class ApiFlowLimiter:
+    def __init__(self, min_interval_ms: int = 700, jitter_ms: int = 250):
+        self.min_interval = min_interval_ms / 1000.0
+        self.jitter = jitter_ms / 1000.0
+        self.lock = threading.Lock()
+        self.last_call = 0.0
+
+    def wait_slot(self):
+        with self.lock:
+            now = time.time()
+            target_delay = self.min_interval + random.uniform(0.0, self.jitter)
+            diff = now - self.last_call
+            if diff < target_delay:
+                time.sleep(target_delay - diff)
+            self.last_call = time.time()
+
+global_flow_limiter = ApiFlowLimiter()
+
+class TsSegmentCache:
+    def __init__(self, max_mb: int = 100, max_age_sec: int = 180):
+        self.max_bytes = max_mb * 1024 * 1024
+        self.max_age = max_age_sec
+        self.lock = threading.Lock()
+        self.cache: dict[str, tuple[bytes, dict, float]] = {}
+        self.order = collections.deque()
+        self.curr_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> tuple[bytes, dict] | None:
+        with self.lock:
+            item = self.cache.get(key)
+            if not item:
+                self.misses += 1
+                return None
+            data, headers, expire_at = item
+            if time.time() > expire_at:
+                self.cache.pop(key, None)
+                self.curr_bytes -= len(data)
+                self.misses += 1
+                return None
+            self.hits += 1
+            return data, headers
+
+    def set(self, key: str, data: bytes, headers: dict):
+        with self.lock:
+            if key in self.cache:
+                old = self.cache.pop(key)
+                self.curr_bytes -= len(old[0])
+            now = time.time()
+            while (self.curr_bytes + len(data) > self.max_bytes) and self.order:
+                old_key = self.order.popleft()
+                old_val = self.cache.pop(old_key, None)
+                if old_val:
+                    self.curr_bytes -= len(old_val[0])
+            self.cache[key] = (data, headers, now + self.max_age)
+            self.order.append(key)
+            self.curr_bytes += len(data)
+
+    def stats(self) -> dict:
+        with self.lock:
+            total = max(1, self.hits + self.misses)
+            return {
+                'count': len(self.cache),
+                'size_mb': round(self.curr_bytes / (1024 * 1024), 2),
+                'hits': self.hits,
+                'misses': self.misses,
+                'hit_rate': f"{round(self.hits / total * 100, 1)}%"
+            }
+
+global_ts_cache = TsSegmentCache(max_mb=100)
+
+def parse_simple_yaml_channels(content: str) -> list[dict]:
+    try:
+        import yaml
+        data = yaml.safe_load(content)
+        if isinstance(data, dict) and 'channels' in data:
+            return data['channels']
+    except Exception:
+        pass
+    channels = []
+    curr = None
+    in_channels = False
+    for line in content.splitlines():
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        if s == 'channels:':
+            in_channels = True
+            continue
+        if in_channels:
+            if s.startswith('- '):
+                if curr and 'ch' in curr:
+                    channels.append(curr)
+                curr = {}
+                s = s[2:].strip()
+            if curr is not None and ':' in s:
+                k, v = s.split(':', 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                curr[k] = v
+    if curr and 'ch' in curr:
+        channels.append(curr)
+    return channels
+
+class ChannelDirectory:
+    def __init__(self, yaml_path: str | None = None):
+        self.yaml_path = yaml_path
+        self.lock = threading.Lock()
+        self.last_mtime = 0.0
+        self.channels_meta: dict[str, dict] = {}
+        self.canonical_slugs: list[str] = []
+        self.load_defaults()
+        if self.yaml_path:
+            self.load_yaml()
+
+    def load_defaults(self):
+        self.canonical_slugs.clear()
+        for slug, name, sid, pid, defn in DEFAULT_CHANNELS:
+            grp = get_channel_group(slug)
+            tid = TVG_IDS.get(slug, slug.upper())
+            logo = f"{LOGO_BASE}/{slug}.png"
+            self.channels_meta[slug] = {
+                'slug': slug, 'name': name, 'sid': sid, 'pid': pid, 'defn': defn,
+                'logo': logo, 'group': grp, 'tvg_id': tid
+            }
+            self.canonical_slugs.append(slug)
+
+    def load_yaml(self):
+        if not self.yaml_path or not os.path.exists(self.yaml_path):
+            return
+        try:
+            mtime = os.path.getmtime(self.yaml_path)
+            with open(self.yaml_path, 'r', encoding='utf-8') as f:
+                parsed = parse_simple_yaml_channels(f.read())
+            if not parsed:
+                return
+            with self.lock:
+                for item in parsed:
+                    raw_slug = str(item.get('ch', '')).strip().lower()
+                    if not raw_slug:
+                        continue
+                    canonical = ALIAS_MAP.get(raw_slug, raw_slug)
+                    name = item.get('chinese') or item.get('name')
+                    sid = str(item.get('cnlid', ''))
+                    pid = str(item.get('livepid', ''))
+                    logo = f"{LOGO_BASE}/{canonical}.png"
+                    grp = get_channel_group(canonical)
+                    tid = TVG_IDS.get(canonical, canonical.upper())
+
+                    meta = {
+                        'slug': canonical, 'name': name or canonical, 'sid': sid, 'pid': pid, 'defn': 'fhd',
+                        'logo': logo, 'group': grp, 'tvg_id': tid
+                    }
+                    self.channels_meta[canonical] = meta
+                    if raw_slug != canonical:
+                        self.channels_meta[raw_slug] = meta
+                    if canonical not in self.canonical_slugs:
+                        self.canonical_slugs.append(canonical)
+                self.last_mtime = mtime
+            log(f"成功载入外部频道配置 [{self.yaml_path}], 包含 {len(self.canonical_slugs)} 个独立频道")
+        except Exception as e:
+            log(f"解析 channels.yaml 失败: {e}")
+
+    def check_reload(self):
+        if not self.yaml_path or not os.path.exists(self.yaml_path):
+            return
+        try:
+            mtime = os.path.getmtime(self.yaml_path)
+            if mtime > self.last_mtime:
+                self.load_yaml()
+        except OSError:
+            pass
+
+    def get_meta(self, slug: str) -> dict | None:
+        self.check_reload()
+        slug = ALIAS_MAP.get(slug.lower(), slug.lower())
+        with self.lock:
+            return self.channels_meta.get(slug)
+
+    def all_channels(self) -> list[dict]:
+        return self.unique_channels()
+
+    def unique_channels(self) -> list[dict]:
+        self.check_reload()
+        with self.lock:
+            return [self.channels_meta[s] for s in self.canonical_slugs if s in self.channels_meta]
+
+global_channel_dir = ChannelDirectory()
+
+class Channel:
     def __init__(self, slug, name, sid, pid, defn):
         self.slug, self.name, self.sid, self.pid, self.defn = (slug, name, sid, pid, defn)
         self.lock = threading.Lock()
@@ -2536,6 +2801,8 @@ class Channel:
         self.bk_urls_time = 0.0
         self.bk_playlist = ''
         self._starting = False
+        self.last_built_playlist = ''
+        self.last_built_time = 0.0
 
 def seg_key(url, pdt):
     if pdt:
@@ -2547,6 +2814,7 @@ def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
 
 def jce_fetch(ch):
+    global_flow_limiter.wait_slot()
     now = int(time.time())
     m3u8_url = jce_timeshift_url(ch.pid, ch.sid, now - WINDOW, now, ch.defn)
     req = urllib.request.Request(m3u8_url, headers={'User-Agent': UA})
@@ -2605,6 +2873,7 @@ def jce_refresh(ch):
     return True
 
 def bk_refresh(ch):
+    global_flow_limiter.wait_slot()
     now = time.time()
     if now - ch.bk_urls_time > BK_URL_TTL or not ch.bk_urls:
         ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
@@ -2623,8 +2892,6 @@ def bk_refresh(ch):
                 return True
             except urllib.error.HTTPError as e:
                 last_err = 'HTTPError: HTTP %s' % e.code
-                if e.code == 403:
-                    time.sleep(2)
                 continue
             except Exception as e:
                 last_err = '%s: %s' % (type(e).__name__, e)
@@ -2635,6 +2902,7 @@ def bk_refresh(ch):
                 log('%s 地址疑似过期, 已重取' % ch.slug)
             except Exception:
                 pass
+    ch.bk_urls = []
     ch.bk_urls_time = 0
     raise RuntimeError(last_err[:120] or 'bk playlist failed')
 
@@ -2688,7 +2956,7 @@ def ensure_channel(ch):
             return
     try:
         if need_fetch:
-            refresh_once(ch)
+            coalesce_refresh(ch.slug, lambda: refresh_once(ch))
         if thread_dead:
             ch.thread = threading.Thread(target=refresh_loop, args=(ch,), daemon=True)
             ch.thread.start()
@@ -2696,7 +2964,7 @@ def ensure_channel(ch):
         with ch.lock:
             ch._starting = False
 
-def build_playlist(ch):
+def build_playlist(ch, holdback: bool = True):
     with ch.lock:
         if ch.mode == 'bk':
             return ch.bk_playlist or None
@@ -2704,20 +2972,31 @@ def build_playlist(ch):
         segs = [ch.segments[k] for k in keys if k in ch.segments]
     if not segs:
         return None
-    target = max(6, max((int(s[1] + 0.5) for s in segs)))
-    out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:%d' % target, '#EXT-X-MEDIA-SEQUENCE:%d' % segs[0][0]]
-    for _, dur, pdt, url in segs:
+    if holdback and len(segs) >= 4:
+        display_segs = segs[:-1]
+    else:
+        display_segs = segs
+    target = max(6, max((int(s[1] + 0.5) for s in display_segs)))
+    out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:%d' % target, '#EXT-X-MEDIA-SEQUENCE:%d' % display_segs[0][0]]
+    for _, dur, pdt, url in display_segs:
         if pdt:
             out.append('#EXT-X-PROGRAM-DATE-TIME:' + pdt)
         out.append('#EXTINF:%.3f,' % dur)
         out.append(url)
-    return '\n'.join(out) + '\n'
-CHANNEL_MAP = {c[0]: Channel(*c) for c in CHANNELS}
+    res = '\n'.join(out) + '\n'
+    with ch.lock:
+        ch.last_built_playlist = res
+        ch.last_built_time = time.time()
+    return res
+
+CHANNEL_MAP: dict[str, Channel] = {c[0]: Channel(*c) for c in DEFAULT_CHANNELS}
 FORCE_BK = {'cctv11', 'cctv12', 'cctv14', 'cctv15', 'cctv16', 'cctv164k', 'cctv17', 'cctv4k', 'cctvfyjc', 'cctvdyjc', 'cctvhjjc'}
 for _s in FORCE_BK:
     if _s in CHANNEL_MAP:
         CHANNEL_MAP[_s].mode = 'bk'
+
 server_port: int = 8767
+server_start_time = time.time()
 resolver: Resolver | None = None
 _resolver_ready: bool = False
 _resolver_lock = threading.Lock()
@@ -2734,13 +3013,27 @@ def set_resolver_ready(ready: bool) -> None:
 _last_channel_request: dict[str, float] = {}
 _last_channel_request_lock = threading.Lock()
 
+def get_channel_instance(slug: str) -> Channel | None:
+    slug = normalize_channel(slug)
+    canonical = ALIAS_MAP.get(slug, slug)
+    if canonical in CHANNEL_MAP:
+        return CHANNEL_MAP[canonical]
+    meta = global_channel_dir.get_meta(canonical)
+    if meta:
+        ch = Channel(meta['slug'], meta['name'], meta['sid'], meta['pid'], meta['defn'])
+        if canonical in FORCE_BK:
+            ch.mode = 'bk'
+        CHANNEL_MAP[canonical] = ch
+        return ch
+    return None
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'ysp-live/7.3'
+    server_version = 'ysp-live/8.0.0'
 
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, code, body, ctype='text/plain; charset=utf-8', head_only=False):
+    def _send(self, code, body, ctype='text/plain; charset=utf-8', head_only=False, extra_headers=None):
         data = body.encode('utf-8') if isinstance(body, str) else body
         try:
             self.send_response(code)
@@ -2748,6 +3041,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(data)))
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Cache-Control', 'no-cache, no-store, max-age=0')
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
             if not head_only:
                 self.wfile.write(data)
@@ -2761,43 +3057,97 @@ class Handler(BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(self.path)
         path = parts.path
         catchup_times = parse_catchup_query(parts.query)
+
         if path in ('/', '/index.html'):
-            self._send(200, index_page(server_port), 'text/html; charset=utf-8', head_only=head_only)
+            host = self.headers.get('Host', f'localhost:{server_port}')
+            text = (
+                f"ysp-live IPTV 直播网关运行中 (端口: {server_port})\n\n"
+                f"全频道订阅: http://{host}/all.m3u\n"
+                f"系统健康度: http://{host}/health\n"
+                f"实时诊断日志: http://{host}/diag\n"
+            )
+            self._send(200, text, 'text/plain; charset=utf-8', head_only=head_only)
             return
+
+        if path == '/favicon.ico':
+            fav = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">📺</text></svg>'
+            self._send(200, fav, 'image/svg+xml', head_only=head_only)
+            return
+
         if path == '/health':
-            self._send(200, 'ok', head_only=head_only)
+            now = time.time()
+            sess = resolver.state.app_session if resolver else None
+            engine_ready = resolver_ready()
+            cache_info = global_ts_cache.stats()
+            health_data = {
+                "ok": True,
+                "version": "8.0.0",
+                "uptime_sec": int(now - server_start_time),
+                "engine": {
+                    "ready": engine_ready,
+                    "session_valid": bool(sess and resolver and resolver.app_session_fresh(sess)),
+                    "heartbeat_count": sess.heartbeat_count if sess else 0,
+                    "guid": sess.cloud_guid if sess else ""
+                },
+                "channels": len(global_channel_dir.unique_channels()),
+                "ts_cache": cache_info,
+                "routes": ["/", "/all.m3u", "/diag", "/health", "/<channel>.m3u8", "/proxy.ts"]
+            }
+            self._send(200, json.dumps(health_data, ensure_ascii=False, indent=2), 'application/json; charset=utf-8', head_only=head_only)
             return
+
         if path == '/all.m3u':
             host = self.headers.get('Host', f'localhost:{server_port}')
             proto = self.headers.get('X-Forwarded-Proto', 'http')
-            lines = ['#EXTM3U url-tvg="https://live.fanmingming.com/e.xml,https://epg.112114.xyz/pp.xml.gz"']
-            for slug, name, _s, _p, _d in CHANNELS:
-                attrs = ''
-                tid = TVG_IDS.get(slug)
-                if tid:
-                    attrs += ' tvg-id="%s"' % tid
-                grp = get_channel_group(slug)
-                attrs += ' tvg-logo="%s/%s.png" group-title="%s"' % (LOGO_BASE, slug, grp)
+            qs = urllib.parse.parse_qs(parts.query)
+            target_group = qs.get('group', [None])[0]
+            only_4k = bool(qs.get('k4', [0])[0])
+
+            lines = [
+                '#EXTM3U url-tvg="https://live.fanmingming.com/e.xml,https://epg.112114.xyz/pp.xml.gz" x-tvg-url="https://epg.zsdc.eu.org/t.xml"',
+                '#EXT-X-APTV-PREVIEW: FALSE',
+                '#EXT-X-APTV-LATENCY: FALSE',
+                '#EXT-X-APTV-LOGO: FALSE'
+            ]
+            for ch_meta in global_channel_dir.unique_channels():
+                slug = ch_meta['slug']
+                name = ch_meta['name']
+                grp = ch_meta['group']
+                logo = ch_meta['logo']
+                tid = ch_meta['tvg_id']
+
+                if target_group and target_group not in grp:
+                    continue
+                if only_4k and (slug not in TRUE_4K_CHANNELS):
+                    continue
+
+                attrs = f' tvg-id="{tid}" tvg-name="{name}" tvg-logo="{logo}" group-title="{grp}"'
                 if slug in TIMESHIFT_SUPPORTED:
                     attrs += ' catchup="append" catchup-days="7" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"'
-                lines.append('#EXTINF:-1%s tvg-name="%s",%s' % (attrs, name, name))
-                lines.append('%s://%s/%s.m3u8' % (proto, host, slug))
+                lines.append(f'#EXTINF:-1{attrs},{name}')
+                lines.append(f'{proto}://{host}/{slug}.m3u8')
             self._send(200, '\n'.join(lines) + '\n', 'application/vnd.apple.mpegurl', head_only=head_only)
             return
+
         if path == '/diag':
             info = []
             now = time.time()
-            engine_status = '就绪' if resolver_ready() else '未就绪(1080p回退)'
+            engine_status = '就绪' if resolver_ready() else '未就绪(1080p自动回退)'
             sess = resolver.state.app_session if resolver else None
             sess_info = f"Session: {('有效' if sess and resolver and resolver.app_session_fresh(sess) else '未就绪')}, 心跳次数={(sess.heartbeat_count if sess else 0)}"
-            info.append(f'设备引擎状态: {engine_status} ({sess_info})')
+            info.append(f"ysp-live v8.0 诊断报告 (运行时间: {int(now - server_start_time)}s)")
+            info.append(f"设备引擎状态: {engine_status} ({sess_info})")
             info.append(f"设备 GUID: {(sess.cloud_guid if sess else '无')}")
             if sess and sess.last_heartbeat_error:
                 info.append(f'心跳日志: {sess.last_heartbeat_error}')
-            info.append('--- 频道状态 ---')
-            for slug, ch in CHANNEL_MAP.items():
-                age = '%ds前' % int(now - ch.last_ok) if ch.last_ok else '从未成功'
-                mode_str = '4K/高码率' if slug in BACKEND_CHANNELS and resolver_ready() else ch.mode
+            c_stats = global_ts_cache.stats()
+            info.append(f"分片内存缓存: 条目={c_stats['count']}, 占用={c_stats['size_mb']}MB, 命中率={c_stats['hit_rate']} (命中:{c_stats['hits']}/未中:{c_stats['misses']})")
+            info.append('--- 频道状态列表 ---')
+            for ch_meta in global_channel_dir.unique_channels():
+                slug = ch_meta['slug']
+                ch = CHANNEL_MAP.get(slug)
+                age = '%ds前' % int(now - ch.last_ok) if ch and ch.last_ok else '从未拉取'
+                mode_str = '4K/高码率' if slug in BACKEND_CHANNELS and resolver_ready() else (ch.mode if ch else 'idle')
                 cooldown_str = ''
                 if resolver and resolver.is_channel_in_cooldown(slug):
                     fail_info = resolver.get_channel_failure_info(slug)
@@ -2806,9 +3156,11 @@ class Handler(BaseHTTPRequestHandler):
                         cd = min(base_cd * (2 ** max(0, fail_info[2] - 1)), 300.0)
                         rem_sec = max(0, int(cd - (now - fail_info[0])))
                         cooldown_str = f' [高码冷却剩{rem_sec}s]'
-                info.append('%s 模式=%s%s 上次刷新=%s 错误=%s' % (slug, mode_str, cooldown_str, age, ch.last_error or '无'))
+                err_msg = ch.last_error if ch else '无'
+                info.append(f"{slug} ({ch_meta['name']}) 模式={mode_str}{cooldown_str} 上次刷新={age} 错误={err_msg or '无'}")
             self._send(200, '\n'.join(info) + '\n', head_only=head_only)
             return
+
         if path in ('/proxy.ts', '/proxy'):
             token = proxy_ts_token(self.path)
             if not token:
@@ -2819,46 +3171,77 @@ class Handler(BaseHTTPRequestHandler):
             except YsptpError as err:
                 self._send(400, f'{err}\n', head_only=head_only)
                 return
+
+            cached_item = global_ts_cache.get(real_url)
+            if cached_item is not None:
+                cached_bytes, cached_headers = cached_item
+                try:
+                    self.send_response(200)
+                    for k, v in cached_headers.items():
+                        self.send_header(k, v)
+                    self.send_header('X-Cache', 'HIT-RAM')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header('Cache-Control', 'public, max-age=300')
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(cached_bytes)
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
             try:
                 playback_headers = resolver.playback_headers_for_ts_url(real_url) if resolver else {}
             except YsptpError as err:
                 self._send(500, f'{err}\n', head_only=head_only)
                 return
             try:
-                parts = urllib.parse.urlsplit(real_url)
-                host = parts.hostname
+                parts_url = urllib.parse.urlsplit(real_url)
+                host = parts_url.hostname
                 if not host:
                     self._send(400, 'invalid ts host\n', head_only=head_only)
                     return
-                port = parts.port or 80
-                host_header = f'{host}:{parts.port}' if parts.port else host
-                target = parts.path or '/'
-                if parts.query:
-                    target += '?' + parts.query
+                port = parts_url.port or 80
+                host_header = f'{host}:{parts_url.port}' if parts_url.port else host
+                target = parts_url.path or '/'
+                if parts_url.query:
+                    target += '?' + parts_url.query
                 extra = {}
                 range_header = self.headers.get('Range')
                 if range_header:
                     extra['Range'] = header_value_clean(range_header)
                 headers = _playback_request_headers(playback_headers, extra)
                 headers['Host'] = host_header
+
                 conn = http.client.HTTPConnection(host, port, timeout=15)
                 req_method = 'HEAD' if head_only else 'GET'
                 conn.request(req_method, target, headers=headers)
                 resp = conn.getresponse()
-                self.send_response(resp.status)
+
+                resp_headers_to_pass = {}
                 for k, v in resp.getheaders():
                     kl = k.lower()
                     if kl in ('content-type', 'content-range', 'accept-ranges', 'content-length'):
-                        self.send_header(k, v)
+                        resp_headers_to_pass[k] = v
+
+                self.send_response(resp.status)
+                for k, v in resp_headers_to_pass.items():
+                    self.send_header(k, v)
+                self.send_header('X-Cache', 'MISS-UPSTREAM')
                 self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Cache-Control', 'no-cache, no-store, max-age=0')
+                self.send_header('Cache-Control', 'public, max-age=300')
                 self.end_headers()
+
                 if not head_only:
+                    body_buffer = bytearray()
                     while True:
                         chunk = resp.read(262144)
                         if not chunk:
                             break
                         self.wfile.write(chunk)
+                        if resp.status == 200 and len(body_buffer) < 15 * 1024 * 1024:
+                            body_buffer.extend(chunk)
+                    if resp.status == 200 and body_buffer:
+                        global_ts_cache.set(real_url, bytes(body_buffer), resp_headers_to_pass)
                 conn.close()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -2868,14 +3251,17 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
-        m = re.match('^/([\\w-]+)\\.m3u8$', path)
+
+        m = re.match(r'^/([\w-]+)\.m3u8$', path)
         if m:
-            slug = normalize_channel(m.group(1))
-            ch = CHANNEL_MAP.get(slug)
+            raw_slug = normalize_channel(m.group(1))
+            canonical = ALIAS_MAP.get(raw_slug, raw_slug)
+            ch = get_channel_instance(canonical)
             if not ch:
                 self._send(404, '未知频道\n', head_only=head_only)
                 return
-            if catchup_times and (slug in TIMESHIFT_SUPPORTED):
+
+            if catchup_times and (canonical in TIMESHIFT_SUPPORTED):
                 start_ts, end_ts = catchup_times
                 try:
                     m3u8_url = jce_timeshift_url(ch.pid, ch.sid, start_ts, end_ts, ch.defn)
@@ -2883,12 +3269,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, pl, 'application/vnd.apple.mpegurl', head_only=head_only)
                     return
                 except Exception as e:
-                    log('回看/时移获取失败 [%s] (%d-%d): %s，回退直播' % (slug, start_ts, end_ts, e))
-            if slug in BACKEND_CHANNELS and resolver_ready() and (resolver is not None):
+                    log('回看/时移获取失败 [%s] (%d-%d): %s，回退直播' % (canonical, start_ts, end_ts, e))
+
+            now_ts = time.time()
+            with ch.lock:
+                cached_pl = ch.last_built_playlist
+                cached_age = now_ts - ch.last_built_time
+            if cached_pl and cached_age < 15.0 and ('#EXTM3U' in cached_pl):
+                self._send(200, cached_pl, 'application/vnd.apple.mpegurl', head_only=head_only, extra_headers={'X-SWR': 'HIT'})
+                if cached_age > 6.0:
+                    threading.Thread(target=refresh_once, args=(ch,), daemon=True).start()
+                return
+
+            if canonical in BACKEND_CHANNELS and resolver_ready() and (resolver is not None):
                 now = now_f64()
                 client_ip = self.client_address[0] if hasattr(self, 'client_address') and self.client_address else 'local'
                 ua = self.headers.get('User-Agent', '')
-                client_key = f"{client_ip}:{ua}:{slug}"
+                client_key = f"{client_ip}:{ua}:{canonical}"
                 with _last_channel_request_lock:
                     last_req = _last_channel_request.get(client_key, 0.0)
                     _last_channel_request[client_key] = now
@@ -2897,45 +3294,32 @@ class Handler(BaseHTTPRequestHandler):
                         for k in [k for k, v in _last_channel_request.items() if v < cutoff]:
                             _last_channel_request.pop(k, None)
 
-                # 用户新打开或关掉后重新打开频道（距上次请求超过 5 秒），优先保证 4K/高码率：清除此频道的失败冷却
                 if (now - last_req) > 5.0:
-                    resolver.clear_channel_cooldown(slug)
+                    resolver.clear_channel_cooldown(canonical)
 
-                if not resolver.is_channel_in_cooldown(slug):
+                if not resolver.is_channel_in_cooldown(canonical):
                     try:
                         host = self.headers.get('Host', f'localhost:{server_port}')
-                        pl = resolver.fetch_channel_playlist(slug, host)
+                        pl = resolver.fetch_channel_playlist(canonical, host)
                         if pl and '#EXTM3U' in pl:
                             self._send(200, pl, 'application/vnd.apple.mpegurl', head_only=head_only)
                             return
                     except Exception as e:
-                        fail_info = resolver.get_channel_failure_info(slug) if resolver else None
+                        fail_info = resolver.get_channel_failure_info(canonical) if resolver else None
                         base_cd = max(float(resolver.args.refresh_error_cooldown), 30.0) if resolver else 30.0
                         cd_sec = int(min(base_cd * (2 ** max(0, (fail_info[2] - 1) if fail_info else 0)), 300.0))
-                        log(f'4K/高码率 {slug} 获取失败: {e}，回退 1080p (进入冷却 {cd_sec}s)')
-            ensure_channel(ch)
-            pl = build_playlist(ch)
-            if not pl:
-                self._send(503, '频道 %s 暂无数据 (%s), 请稍后重试\n' % (ch.name, ch.last_error or '拉取中'), head_only=head_only)
-                return
-            self._send(200, pl, 'application/vnd.apple.mpegurl', head_only=head_only)
-            return
-        self._send(404, 'not found\n', head_only=head_only)
+                        log(f'4K/高码率 {canonical} 获取失败: {e}，自动回退 1080p (进入冷却 {cd_sec}s)')
 
-def index_page(port: int):
-    items = []
-    k4 = resolver_ready()
-    for slug, name, _s, _p, _d in CHANNELS:
-        tags = []
-        if slug in TRUE_4K_CHANNELS:
-            tags.append('<b style="color:#c00">[真4K]</b>' if k4 else '<span style="color:#888">[4K准备中]</span>')
-        elif slug in BACKEND_CHANNELS:
-            tags.append('<b style="color:#c00">[高码率]</b>' if k4 else '<span style="color:#888">[准备中]</span>')
-        if slug in TIMESHIFT_SUPPORTED:
-            tags.append('<span style="color:#090;font-size:12px">[7天时移回看]</span>')
-        tag_str = (' ' + ' '.join(tags)) if tags else ''
-        items.append('<li><a href="/%s.m3u8">%s</a>%s <span>/%s.m3u8</span></li>' % (slug, name, tag_str, slug))
-    return '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>央视频全频道直播</title><style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:760px;margin:0 auto;padding:20px;}li{margin:6px 0;}span{color:#888;font-size:12px;margin-left:8px;}</style></head><body><h2>央视频全频道直播 (%d 路%s)</h2><p>把链接粘贴到播放器即可观看，单端口 (:%d) 提供全部播放列表与分片转发。</p><p>聚合订阅: <a href="/all.m3u">/all.m3u</a> (64 路一次导入，已集成 7 天回看时移与多源 EPG)</p><ul>%s</ul></body></html>' % (len(items), '，含真4K' if k4 else '', port, ''.join(items))
+            ensure_channel(ch)
+            pl = build_playlist(ch, holdback=True)
+            if pl and '#EXTM3U' in pl:
+                self._send(200, pl, 'application/vnd.apple.mpegurl', head_only=head_only)
+                return
+
+            self._send(503, '频道 %s 暂无数据 (%s), 请稍后重试\n' % (ch.name, ch.last_error or '拉取中'), head_only=head_only)
+            return
+
+        self._send(404, 'not found\n', head_only=head_only)
 
 def init_resolver():
     if resolver is None:
@@ -2963,13 +3347,24 @@ def init_resolver():
             time.sleep(10.0)
 
 def main():
-    global resolver, server_port
-    ap = argparse.ArgumentParser(description='央视频全频道直播代理（纯 Python，单端口版）')
+    global resolver, server_port, global_channel_dir, global_ts_cache
+    ap = argparse.ArgumentParser(description='央视频全频道直播代理（ysp-live v8.0 旗舰单端口版）')
     ap.add_argument('port', nargs='?', type=int, default=8767, help='监听端口 (默认 8767)')
     ap.add_argument('--bind', default='0.0.0.0', help='监听地址 (默认 0.0.0.0)')
+    ap.add_argument('--channels', default=None, help='channels.yaml 路径 (默认自动搜寻当前目录下的 channels.yaml)')
+    ap.add_argument('--cache-mb', type=int, default=100, help='TS 分片内存缓存大小 (MB, 默认 100)')
     ap.add_argument('--no-4k', action='store_true', help='不启动设备协议 (仅走 1080p JCE/bkliveinfo)')
     args = ap.parse_args()
+
     server_port = args.port
+
+    if args.cache_mb > 0:
+        global_ts_cache = TsSegmentCache(max_mb=args.cache_mb)
+
+    channels_path = args.channels or os.environ.get('YSP_CHANNELS_PATH')
+    if channels_path and os.path.exists(channels_path):
+        global_channel_dir = ChannelDirectory(channels_path)
+
     here = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.environ.get('YSP_DATA_DIR', here)
     if data_dir and not os.path.exists(data_dir):
@@ -2977,28 +3372,39 @@ def main():
             os.makedirs(data_dir, exist_ok=True)
         except OSError:
             data_dir = here
-    engine_args = argparse.Namespace(host=args.bind, port=args.port, timeout=15.0, insecure_tls=False, cache_ttl=600.0, stale_while_refresh_ttl=120.0, refresh_error_cooldown=30.0, playlist_cache_ttl=0.0, background_refresh_queue_limit=4, http_workers=16, http_queue_limit=1000, identity_reset_error_threshold=int(os.environ.get('YSP_IDENTITY_RESET_THRESHOLD', '3')), identity_reset_cooldown=300.0, refresh_interval=1.0, control_step_jitter_min_ms=0, control_step_jitter_max_ms=0, heartbeat_interval=30.0, heartbeat_ttl_guard=60.0, session_ttl=7200.0, meta_json=os.path.join(data_dir, 'proxy-cache-state-rs.json'), device_json=os.path.join(data_dir, 'device-state-rs.json'))
+
+    engine_args = argparse.Namespace(
+        host=args.bind, port=args.port, timeout=15.0, insecure_tls=False, cache_ttl=600.0,
+        stale_while_refresh_ttl=120.0, refresh_error_cooldown=30.0, playlist_cache_ttl=0.0,
+        background_refresh_queue_limit=4, http_workers=16, http_queue_limit=1000,
+        identity_reset_error_threshold=0, identity_reset_cooldown=300.0, refresh_interval=1.0,
+        control_step_jitter_min_ms=0, control_step_jitter_max_ms=0, heartbeat_interval=30.0,
+        heartbeat_ttl_guard=60.0, session_ttl=7200.0,
+        meta_json=os.path.join(data_dir, 'proxy-cache-state-rs.json'),
+        device_json=os.path.join(data_dir, 'device-state-rs.json')
+    )
     resolve_paths(engine_args)
-    # 已获取链接数只记在内存里，重启后无法得知旧设备还剩多少额度，因此每次启动都换新设备
-    if LINKS_PER_DEVICE > 0:
-        try:
-            os.remove(engine_args.device_json)
-        except OSError:
-            pass
     resolver = Resolver(engine_args)
     if not args.no_4k:
         resolver.start_heartbeat()
         resolver.start_refresh_worker()
         resolver.start_keep_warm_worker()
         threading.Thread(target=init_resolver, daemon=True, name='engine-init').start()
+
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    log('ysp-live v7.3 启动: %d 个频道, 监听端口 %d (单端口架构)' % (len(CHANNEL_MAP), args.port))
-    log('首页: http://localhost:%d/' % args.port)
-    log('全频道订阅: http://localhost:%d/all.m3u' % args.port)
-    log('诊断信息: http://localhost:%d/diag' % args.port)
+    channels_count = len(global_channel_dir.unique_channels())
+    c_yangshi = len([c for c in global_channel_dir.unique_channels() if c['group'] == '央视'])
+    c_weishi = len([c for c in global_channel_dir.unique_channels() if c['group'] == '卫视'])
+    log('====================================================================')
+    log(f'ysp-live v8.0 启动成功: {channels_count} 个独立频道 (央视 {c_yangshi} 路, 卫视 {c_weishi} 路)')
+    log(f'全频道订阅:   http://localhost:{args.port}/all.m3u')
+    log(f'系统健康度:   http://localhost:{args.port}/health')
+    log(f'实时诊断日志: http://localhost:{args.port}/diag')
+    log('====================================================================')
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         log('服务已停止')
+
 if __name__ == '__main__':
     main()
