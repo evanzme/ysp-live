@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-LABEL description="央视频全频道直播代理 v7.2（纯 Python，单端口版）"
+LABEL description="央视频全频道直播代理 v7.3（纯 Python，单端口版）"
 
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \

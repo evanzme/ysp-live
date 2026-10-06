@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
-__version__ = '7.2.0'
+__version__ = '7.3.0'
 AK = '9f5c54c4ed0e50109b800f7e28fec205'
 RSA_PUBLIC_KEY_B64 = 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkKeLy4ywWLSnBkwRyqYgF3HMIj05V5uuh5HjyEsZOWnu1NHu3jPQv3sr32wwQNYv5qapsNXmNgLUDHtgHZxqPQAYXltjSRc0qhcD286t62wOIHId8zXS3s1Jy4rgU4qjQWzI9rp/1sE0pMsmwTaJa4zuJ5iz8VwF8Av5oJ1k+HxY+/HLnjNlW1hmWLpuDYmkZYuAoTHa1VGeHQh9FEKI8ZcL3GTQphShUoC+Kg3P1hGUVTtCYapmzPS5lkAdwebuzwvTCfGiTErYZCnPBUSeV7BVlgjtLYIi29KvF0a8FHsJMfe/UdHcyW/RihsIYOtDQcRRpFGXyPXbVrzFJse24QIDAQAB'
 CLOUD_GET_URL = 'https://ytpcloudws.cctv.cn/cloudps/wssapi/device/v2/get'
@@ -2380,7 +2380,7 @@ UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 REFRESH_INTERVAL = 10
 IDLE_TIMEOUT = 120
 WINDOW = 300
-MAX_SEGS = 60
+MAX_SEGS = 120
 BK_URL_TTL = 300
 BACKEND_CHANNELS = {'cctv1', 'cctv2', 'cctv3', 'cctv4', 'cctv5', 'cctv5p', 'cctv7', 'cctv8', 'cctv9', 'cctv10', 'cctv11', 'cctv12', 'cctv13', 'cctv14', 'cctv15', 'cctv16', 'cctv17', 'cctv4k', 'cctv8k', 'cctv164k', 'cgtn', 'cgtnfr', 'cgtnru', 'cgtnar', 'cgtnes', 'cgtndoc'}
 TRUE_4K_CHANNELS = {'cctv4k', 'cctv8k', 'cctv164k'}
@@ -2476,6 +2476,7 @@ class Channel:
         self.last_error = ''
         self.last_ok = 0.0
         self.mode = 'jce'
+        self.last_pdt = ''
         self.bk_urls = []
         self.bk_urls_time = 0.0
         self.bk_playlist = ''
@@ -2517,15 +2518,30 @@ def jce_refresh(ch):
     segs = jce_fetch(ch)
     with ch.lock:
         added = 0
-        for dur, pdt, url in segs:
-            key = seg_key(url, pdt)
-            if key in ch.segments:
-                ch.segments[key][3] = url
-                continue
-            ch.seq += 1
-            ch.segments[key] = [ch.seq, dur, pdt, url]
-            ch.order.append(key)
-            added += 1
+        if not ch.order:
+            init_segs = segs[-25:] if len(segs) > 25 else segs
+            for dur, pdt, url in init_segs:
+                key = seg_key(url, pdt)
+                ch.seq += 1
+                ch.segments[key] = [ch.seq, dur, pdt, url]
+                ch.order.append(key)
+                added += 1
+                if pdt:
+                    ch.last_pdt = pdt
+        else:
+            for dur, pdt, url in segs:
+                if pdt and ch.last_pdt and pdt <= ch.last_pdt:
+                    continue
+                key = seg_key(url, pdt)
+                if key in ch.segments:
+                    ch.segments[key][3] = url
+                    continue
+                ch.seq += 1
+                ch.segments[key] = [ch.seq, dur, pdt, url]
+                ch.order.append(key)
+                if pdt:
+                    ch.last_pdt = pdt
+                added += 1
         while len(ch.order) > MAX_SEGS:
             ch.segments.pop(ch.order.popleft(), None)
         ch.last_error = ''
@@ -2606,6 +2622,7 @@ def ensure_channel(ch):
         if cache_stale:
             ch.segments.clear()
             ch.order.clear()
+            ch.last_pdt = ''
             ch.bk_playlist = ''
             need_fetch = True
         else:
@@ -2663,7 +2680,7 @@ _last_channel_request: dict[str, float] = {}
 _last_channel_request_lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'ysp-live/7.2'
+    server_version = 'ysp-live/7.3'
 
     def log_message(self, fmt, *args):
         pass
@@ -2914,7 +2931,7 @@ def main():
         resolver.start_keep_warm_worker()
         threading.Thread(target=init_resolver, daemon=True, name='engine-init').start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    log('ysp-live v7.2 启动: %d 个频道, 监听端口 %d (单端口架构)' % (len(CHANNEL_MAP), args.port))
+    log('ysp-live v7.3 启动: %d 个频道, 监听端口 %d (单端口架构)' % (len(CHANNEL_MAP), args.port))
     log('首页: http://localhost:%d/' % args.port)
     log('全频道订阅: http://localhost:%d/all.m3u' % args.port)
     log('诊断信息: http://localhost:%d/diag' % args.port)
