@@ -388,7 +388,11 @@ def is_session_invalidating_error(message: str) -> bool:
 
 def is_identity_recoverable_error(message: str) -> bool:
     lower = message.lower()
-    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower)
+    return is_session_invalidating_error(message) or is_control_plane_http_400(lower) or 'upstream m3u8 http 400' in lower or ('upstream m3u8 http 401' in lower) or ('upstream m3u8 http 403' in lower) or ('upstream m3u8 http 404' in lower) or ('playlist response missing' in lower) or ('invalid playlist status' in lower) or ('connection reset' in lower) or ('connection refused' in lower) or ('operation timed out' in lower) or ('timed out' in lower) or ('network is unreachable' in lower) or ('nodename nor servname' in lower) or ('failed to lookup address' in lower) or ('vdn did not return final url' in lower)
+
+def is_device_blocked_error(message: str) -> bool:
+    lower = message.lower()
+    return 'live/v1/01 http 400' in lower or 'vdn did not return final url' in lower
 
 def normalize_channel(raw: str) -> str:
     key = raw.strip().strip('/').lower()
@@ -955,6 +959,7 @@ class ResolverState:
         self.last_identity_reset_at = 0.0
         self.last_identity_reset_reason = ''
         self.ad_display = False
+        self.last_device_rotate_at = 0.0
 
 @dataclasses.dataclass
 class AppSession:
@@ -972,6 +977,7 @@ class AppSession:
     heartbeat_count: int
     last_heartbeat_result: str
     last_heartbeat_error: str
+    links_obtained: int = 0
 
 class RefreshQueue:
 
@@ -1159,6 +1165,13 @@ class Resolver:
             self.state.identity_reset_error_count = 0
 
     def reset_identity_and_cache(self, reason: str):
+        # 删除设备与缓存文件，下次 bootstrap 生成全新设备身份（被风控的身份重用无意义）
+        for path in (self.args.device_json, self.args.meta_json):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        log(f'设备身份已重置: {reason[:120]}')
         with self.state_lock:
             self.state.cache.clear()
             self.state.playlist_cache.clear()
@@ -1321,6 +1334,7 @@ class Resolver:
             self.state.generation += 1
             generation = self.state.generation
         log_program_fetching()
+        app_session = None
         try:
             app_session = self.get_app_session_controlled()
             live_id = channel_by_name(channel)
@@ -1333,6 +1347,18 @@ class Resolver:
                 self.state.refreshing_channel = ''
                 if is_session_invalidating_error(str(err)):
                     self.state.app_session = None
+                # 设备被风控 (live/v1/01 400 或 VDN 内部错误) 时立即换设备，不等累计阈值；
+                # 新注册的设备也可能一开始就不可用，同样适用。限制 10 秒内最多换一次，避免反复切换
+                blocked = (
+                    app_session is not None
+                    and is_device_blocked_error(str(err))
+                    and now_f64() - self.state.last_device_rotate_at >= 10.0
+                )
+                if blocked:
+                    self.state.app_session = None
+                    self.state.last_device_rotate_at = now_f64()
+            if blocked:
+                self.rotate_device(app_session, f'请求被拒 ({str(err)[:60]})')
             raise
         with self.state_lock:
             self.state.last_business_end_at = now_f64()
@@ -1343,7 +1369,33 @@ class Resolver:
             self.state.identity_reset_error_count = 0
             self.state.last_error = ''
             log_channel_ready(channel)
+            rotate = False
+            if LINKS_PER_DEVICE > 0 and app_session is self.state.app_session:
+                app_session.links_obtained += 1
+                if app_session.links_obtained >= LINKS_PER_DEVICE:
+                    self.state.app_session = None
+                    self.state.last_device_rotate_at = now_f64()
+                    rotate = True
+        if rotate:
+            self.rotate_device(app_session, f'已获取 {app_session.links_obtained} 个 4K 链接')
         return entry
+
+    def rotate_device(self, old: AppSession, reason: str) -> None:
+        # 单设备获取 4K 链接数有上限，超过会被风控 (live/v1/01 HTTP 400)，因此主动换新设备。
+        # 已缓存的链接自带旧设备的签名头，在过期前仍可继续播放。
+        try:
+            os.remove(self.args.device_json)
+        except OSError:
+            pass
+        log(f'设备 {old.cast_model} {reason}，主动更换新设备')
+
+        def prewarm():
+            try:
+                sess = self.ensure_fresh_session()
+                log(f'新设备 {sess.cast_model} 已就绪')
+            except Exception as e:
+                log(f'新设备预注册失败: {e} (下次请求时重试)')
+        threading.Thread(target=prewarm, daemon=True, name='device-rotate').start()
 
     def ensure_fresh_session(self) -> AppSession:
         with self.state_lock:
@@ -2509,13 +2561,11 @@ WINDOW = 300
 MAX_SEGS = 120
 BK_URL_TTL = 300
 
-BACKEND_CHANNELS = {
-    'cctv1', 'cctv2', 'cctv3', 'cctv4', 'cctv5', 'cctv5p', 'cctv7', 'cctv8',
-    'cctv9', 'cctv10', 'cctv11', 'cctv12', 'cctv13', 'cctv14', 'cctv15',
-    'cctv16', 'cctv17', 'cctv4k', 'cctv8k', 'cctv164k', 'cgtn', 'cgtnfr',
-    'cgtnru', 'cgtnar', 'cgtnes', 'cgtndoc'
-}
+# 走 live/v1/01 高码率接口的频道，其余频道走 1080p (jce/bk)。单设备获取过多会被风控，见 LINKS_PER_DEVICE
+BACKEND_CHANNELS = {c.strip() for c in os.environ.get('YSP_HIGHRATE_CHANNELS', 'cctv1,cctv2,cctv3,cctv4,cctv5,cctv5p,cctv7,cctv8,cctv9,cctv10,cctv11,cctv12,cctv13,cctv14,cctv15,cctv16,cctv17,cctv4k,cctv8k,cctv164k,cgtn,cgtnfr,cgtnru,cgtnar,cgtnes,cgtndoc').split(',') if c.strip()}
 TRUE_4K_CHANNELS = {'cctv4k', 'cctv8k', 'cctv164k'}
+# 每个设备获取多少个 4K 链接后主动换设备，0 表示不主动更换
+LINKS_PER_DEVICE = int(os.environ.get('YSP_LINKS_PER_DEVICE', '4'))
 
 TIMESHIFT_SUPPORTED = {
     "cctv1", "cctv2", "cctv3", "cctv4", "cctv5", "cctv5p", "cctv6", "cctv7", "cctv8", "cctv9", "cctv10", "cctv13", "cctv8k",
@@ -2688,6 +2738,8 @@ class TsSegmentCache:
             }
 
 global_ts_cache = TsSegmentCache(max_mb=100)
+# CCTV-4K 一个 3～4 秒的分片约 16～21MB，单片上限需高于此值才能缓存 4K
+TS_CACHE_MAX_ITEM_BYTES = 40 * 1024 * 1024
 
 class ChannelDirectory:
     def __init__(self):
@@ -3226,7 +3278,7 @@ class Handler(BaseHTTPRequestHandler):
                         if cl_val:
                             try:
                                 expected_len = int(cl_val)
-                                if expected_len > 15 * 1024 * 1024:
+                                if expected_len > TS_CACHE_MAX_ITEM_BYTES:
                                     is_oversized = True
                             except ValueError:
                                 pass
@@ -3236,7 +3288,7 @@ class Handler(BaseHTTPRequestHandler):
                                 break
                             self.wfile.write(chunk)
                             if resp.status == 200 and not is_oversized:
-                                if len(body_buffer) + len(chunk) <= 15 * 1024 * 1024:
+                                if len(body_buffer) + len(chunk) <= TS_CACHE_MAX_ITEM_BYTES:
                                     body_buffer.extend(chunk)
                                 else:
                                     is_oversized = True
@@ -3260,6 +3312,10 @@ class Handler(BaseHTTPRequestHandler):
             target = qs.get('url', [''])[0]
             if not target:
                 self._send(400, 'missing url\n', head_only=head_only)
+                return
+            # 只转发到本机伴生引擎，避免成为可访问任意地址 (含路由器内部服务) 的开放代理
+            if not target.startswith(f'http://127.0.0.1:{engine_port}/'):
+                self._send(403, 'engine proxy only allows the local engine\n', head_only=head_only)
                 return
             try:
                 req = urllib.request.Request(target, headers={'User-Agent': UA, 'Accept': '*/*'})
@@ -3392,7 +3448,9 @@ def start_companion_engine(script_dir: str, port: int = 8787):
         return
     try:
         subp = __import__('subprocess')
-        companion_proc = subp.Popen([node_bin, engine_file, str(port)], stdout=subp.DEVNULL, stderr=subp.DEVNULL)
+        # 引擎的 /segment?url= 可代理任意地址，只监听本机，避免 host 网络模式下暴露到局域网
+        engine_env = dict(os.environ, HOST='127.0.0.1')
+        companion_proc = subp.Popen([node_bin, engine_file, str(port)], stdout=subp.DEVNULL, stderr=subp.DEVNULL, env=engine_env)
         for _ in range(30):
             if is_port_listening(port):
                 log(f'Web WASM 伴生引擎 (Node.js) 自动启动成功: 端口 {port}')
@@ -3440,7 +3498,7 @@ def main():
     ap.add_argument('port', nargs='?', type=int, default=8767, help='监听端口 (默认 8767)')
     ap.add_argument('--bind', default='0.0.0.0', help='监听地址 (默认 0.0.0.0)')
     ap.add_argument('--data-dir', default=os.environ.get('YSP_DATA_DIR', ''), help='数据持久化目录 (默认由 YSP_DATA_DIR 环境变量或脚本所在目录决定)')
-    ap.add_argument('--cache-mb', type=int, default=100, help='TS 分片内存缓存大小 (MB, 默认 100)')
+    ap.add_argument('--cache-mb', type=int, default=int(os.environ.get('YSP_CACHE_MB', '100')), help='TS 分片内存缓存大小 (MB, 默认 100, 环境变量 YSP_CACHE_MB)')
     ap.add_argument('--no-4k', action='store_true', help='不启动设备协议 (仅走 1080p JCE/bkliveinfo)')
     ap.add_argument('--engine-port', type=int, default=8787, help='Web WASM 引擎端口 (默认 8787)')
     ap.add_argument('--no-engine', action='store_true', help='不启动 Web WASM 伴生引擎')
@@ -3474,13 +3532,19 @@ def main():
         host=args.bind, port=args.port, timeout=15.0, insecure_tls=False, cache_ttl=600.0,
         stale_while_refresh_ttl=120.0, refresh_error_cooldown=30.0, playlist_cache_ttl=0.0,
         background_refresh_queue_limit=4, http_workers=16, http_queue_limit=1000,
-        identity_reset_error_threshold=0, identity_reset_cooldown=300.0, refresh_interval=1.0,
+        identity_reset_error_threshold=int(os.environ.get('YSP_IDENTITY_RESET_THRESHOLD', '3')), identity_reset_cooldown=300.0, refresh_interval=1.0,
         control_step_jitter_min_ms=0, control_step_jitter_max_ms=0, heartbeat_interval=30.0,
         heartbeat_ttl_guard=60.0, session_ttl=7200.0,
         meta_json=os.path.join(data_dir, 'proxy-cache-state-rs.json'),
         device_json=os.path.join(data_dir, 'device-state-rs.json')
     )
     resolve_paths(engine_args)
+    # 已获取链接数只记在内存里，重启后无法得知旧设备还剩多少额度，因此每次启动都换新设备
+    if LINKS_PER_DEVICE > 0:
+        try:
+            os.remove(engine_args.device_json)
+        except OSError:
+            pass
     resolver = Resolver(engine_args)
     if not args.no_4k:
         resolver.start_heartbeat()

@@ -1,6 +1,6 @@
 # ysp-live
 
-央视频全频道直播代理（64 路，含 4K / 8K、高码率央视、省级卫视与 7 天回看），基于上游 ysp-live v8.0 修改，
+央视频全频道直播代理（64 路，含 4K / 8K、高码率央视、省级卫视与 7 天回看），基于上游 ysp-live v8.1 修改，
 由 GitHub Actions 构建 `linux/amd64` + `linux/arm64` 镜像发布到 GHCR，适合在软路由（iStoreOS / OpenWrt）、NAS 上用 Docker 运行。
 
 上游原版说明见 [README-DOCKER.md](README-DOCKER.md)（保持原样，便于和后续上游版本对比）。
@@ -21,10 +21,19 @@
 | 启动时换新设备 | 计数只在内存里，重启后无法得知旧设备剩余额度，因此每次启动都用新设备 |
 | 失败兜底 | 连续失败 `YSP_IDENTITY_RESET_THRESHOLD`（默认 3）次后重置身份并删除设备文件（上游此功能默认关闭，且重置后仍复用旧设备） |
 | 高码率频道可配置 | 通过 `YSP_HIGHRATE_CHANNELS` 指定走 4K / 高码率接口的频道 |
-| 修复 v8.0 分片缓存 | 上游超过 15MB 的分片会被截断后缓存（CCTV-4K 一个 3～4 秒的分片约 16MB），后续请求拿到坏分片；改为只缓存完整分片，单片上限 40MB |
-| 修复 v8.0 秒开缓存 | 上游 15 秒播放列表缓存的后台刷新没有重建列表，期间一直返回同一份旧列表；改为刷新后重建，并合并并发刷新 |
+| 4K 分片可缓存 | 上游分片缓存单片上限 15MB，而 CCTV-4K 一个 3～4 秒的分片约 16～21MB，4K 实际从不缓存；单片上限提高到 40MB |
+| 兜底引擎只监听本机 | 上游 Node.js 兜底引擎默认监听 `0.0.0.0:8787`，且 `/segment?url=` 与主程序的 `/engine_proxy?url=` 都能代理任意地址；改为引擎只监听 `127.0.0.1`，`/engine_proxy` 只转发到本机引擎 |
 
 已缓存的链接自带获取时设备的签名，换设备后在过期（10 分钟）前仍可继续播放。
+
+## 线路与兜底
+
+频道按以下顺序获取，前一级失败自动落到下一级：
+
+1. 设备协议 4K / 高码率（`YSP_HIGHRATE_CHANNELS` 中的频道）
+2. 1080p JCE 解析
+3. bkliveinfo 备用线路
+4. 网页版兜底引擎（容器内的 Node.js 进程 `ysp-engine.js`，只在前三级都拿不到播放列表时使用）
 
 ## 部署
 
@@ -74,7 +83,7 @@ http://<路由器局域网IP>:8767/all.m3u
 
 ### 播放建议
 
-- **关闭 APTV 延迟检测**。v8.0 的订阅已带 `#EXT-X-APTV-LATENCY: FALSE`，APTV 会自动关闭；其他播放器若有类似功能也建议关掉。延迟检测会一次性请求全部频道，首次解析需要排队和换设备，后面的频道容易超时。
+- **关闭 APTV 延迟检测**。订阅已带 `#EXT-X-APTV-LATENCY: FALSE`，APTV 会自动关闭；其他播放器若有类似功能也建议关掉。延迟检测会一次性请求全部频道，首次解析需要排队和换设备，后面的频道容易超时。
 - **首次打开频道可能需要 3～20 秒**（恰好需要换设备时较慢），之后 10 分钟内为缓存，秒开。
 - **4K / 8K 频道码率很高**（CCTV-4K 约 36 Mbps），播放设备网络需稳定在 50 Mbps 以上，并建议开启播放器的硬件解码。
 - 只有 CCTV-4K、CCTV-8K、CCTV-16 4K 是真 4K / 8K。其余央视频道的「高码率」是约 12 Mbps 的 1080i50（H.264，SDR），比普通 1080p 源清晰，但分辨率仍是 1080。
@@ -89,7 +98,6 @@ http://<路由器局域网IP>:8767/all.m3u
 | `YSP_IDENTITY_RESET_THRESHOLD` | `3` | 连续失败多少次后重置设备身份（兜底）；`0` 为关闭 |
 | `YSP_HIGHRATE_CHANNELS` | 全部 26 路 | 走 4K / 高码率接口的频道，逗号分隔；其余频道走 1080p。例：`cctv4k,cctv8k,cctv164k,cctv5,cctv5p` |
 | `YSP_CACHE_MB` | `100` | 分片内存缓存大小（MB）。多台设备同看 4K 时可调大，如 `300` |
-| `YSP_CHANNELS_PATH` | 无 | 外部 `channels.yaml` 路径（需挂载进容器），用于追加 / 覆盖频道，修改后自动重新载入 |
 | `TZ` | `Asia/Shanghai` | 日志时区 |
 
 默认 26 路高码率频道：`cctv1`～`cctv5p`、`cctv7`～`cctv17`、`cctv4k`、`cctv8k`、`cctv164k`、`cgtn`、`cgtnfr`、`cgtnru`、`cgtnar`、`cgtnes`、`cgtndoc`。
@@ -128,6 +136,7 @@ cd /opt/ysp-live-docker && docker compose pull && docker compose up -d
 
 上游发布新版本时：
 
-1. 用上游的 `ysp-live.py`、`Dockerfile`、`README.md`（存为 `README-DOCKER.md`）覆盖本仓库文件（上游没有提供的文件保持不变），单独提交一次「Update to upstream vX.Y」。
+1. 用上游的 `ysp-live.py`、`ysp-engine.js`、`README.md`（存为 `README-DOCKER.md`）覆盖本仓库文件，单独提交一次「Update to upstream vX.Y」。`Dockerfile` 只参考上游的依赖变化，不直接覆盖。
+   上游若整体重新排版了 `ysp-live.py`（如 v8.1），可用 `ast.unparse` 规范化前后两个版本再比较，只移植实际改动。
 2. 重新应用本仓库对 `ysp-live.py` 的改动（可参考 `git log` 中上游提交之后的各次提交），确认 `python3 -m py_compile ysp-live.py` 通过。
 3. 推送后等 Actions 完成，在设备上执行更新命令。

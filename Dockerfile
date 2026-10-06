@@ -1,14 +1,17 @@
 FROM python:3.12-alpine
 
-LABEL description="央视频全频道直播代理 v8.0（纯 Python，单端口版）"
+LABEL description="央视频全频道直播代理 v8.1（Python 主网关 + Node.js 网页版兜底引擎，单端口）"
 
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     YSP_DATA_DIR=/app/data
 
+# nodejs 用于运行网页版兜底引擎 ysp-engine.js
+RUN apk add --no-cache nodejs tzdata
+
 WORKDIR /app
 
-COPY ysp-live.py ./
+COPY ysp-live.py ysp-engine.js ./
 
 RUN mkdir -p /app/data
 
