@@ -1,6 +1,6 @@
 # ysp-live
 
-央视频全频道直播代理（64 路，含 4K / 8K、高码率央视、省级卫视与 7 天回看），基于上游 ysp-live v7.3 修改，
+央视频全频道直播代理（64 路，含 4K / 8K、高码率央视、省级卫视与 7 天回看），基于上游 ysp-live v8.0 修改，
 由 GitHub Actions 构建 `linux/amd64` + `linux/arm64` 镜像发布到 GHCR，适合在软路由（iStoreOS / OpenWrt）、NAS 上用 Docker 运行。
 
 上游原版说明见 [README-DOCKER.md](README-DOCKER.md)（保持原样，便于和后续上游版本对比）。
@@ -21,6 +21,8 @@
 | 启动时换新设备 | 计数只在内存里，重启后无法得知旧设备剩余额度，因此每次启动都用新设备 |
 | 失败兜底 | 连续失败 `YSP_IDENTITY_RESET_THRESHOLD`（默认 3）次后重置身份并删除设备文件（上游此功能默认关闭，且重置后仍复用旧设备） |
 | 高码率频道可配置 | 通过 `YSP_HIGHRATE_CHANNELS` 指定走 4K / 高码率接口的频道 |
+| 修复 v8.0 分片缓存 | 上游超过 15MB 的分片会被截断后缓存（CCTV-4K 一个 3～4 秒的分片约 16MB），后续请求拿到坏分片；改为只缓存完整分片，单片上限 40MB |
+| 修复 v8.0 秒开缓存 | 上游 15 秒播放列表缓存的后台刷新没有重建列表，期间一直返回同一份旧列表；改为刷新后重建，并合并并发刷新 |
 
 已缓存的链接自带获取时设备的签名，换设备后在过期（10 分钟）前仍可继续播放。
 
@@ -63,14 +65,16 @@ http://<路由器局域网IP>:8767/all.m3u
 
 | 地址 | 内容 |
 |---|---|
-| `/` | 频道列表首页 |
+| `/` | 服务状态与入口（纯文本） |
 | `/all.m3u` | 64 路聚合订阅，含 EPG 与 7 天回看 |
 | `/<频道>.m3u8` | 单个频道，如 `/cctv4k.m3u8`、`/cctv13.m3u8` |
-| `/diag` | 诊断信息：设备会话状态与各频道刷新情况 |
+| `/all.m3u?group=卫视` | 只订阅某个分组（`央视` / `卫视`） |
+| `/health` | JSON 健康信息：运行时间、设备会话、分片缓存命中率 |
+| `/diag` | 诊断信息：设备会话状态、分片缓存与各频道刷新情况 |
 
 ### 播放建议
 
-- **打开 APTV「关闭延迟检测」**。延迟检测会一次性请求全部频道，首次解析需要排队和换设备，后面的频道容易超时。
+- **关闭 APTV 延迟检测**。v8.0 的订阅已带 `#EXT-X-APTV-LATENCY: FALSE`，APTV 会自动关闭；其他播放器若有类似功能也建议关掉。延迟检测会一次性请求全部频道，首次解析需要排队和换设备，后面的频道容易超时。
 - **首次打开频道可能需要 3～20 秒**（恰好需要换设备时较慢），之后 10 分钟内为缓存，秒开。
 - **4K / 8K 频道码率很高**（CCTV-4K 约 36 Mbps），播放设备网络需稳定在 50 Mbps 以上，并建议开启播放器的硬件解码。
 - 只有 CCTV-4K、CCTV-8K、CCTV-16 4K 是真 4K / 8K。其余央视频道的「高码率」是约 12 Mbps 的 1080i50（H.264，SDR），比普通 1080p 源清晰，但分辨率仍是 1080。
@@ -84,6 +88,8 @@ http://<路由器局域网IP>:8767/all.m3u
 | `YSP_LINKS_PER_DEVICE` | `4` | 每个设备获取多少个 4K 链接后主动换设备；`0` 为不主动更换。日志中仍频繁出现 HTTP 400 时可改为 `3` |
 | `YSP_IDENTITY_RESET_THRESHOLD` | `3` | 连续失败多少次后重置设备身份（兜底）；`0` 为关闭 |
 | `YSP_HIGHRATE_CHANNELS` | 全部 26 路 | 走 4K / 高码率接口的频道，逗号分隔；其余频道走 1080p。例：`cctv4k,cctv8k,cctv164k,cctv5,cctv5p` |
+| `YSP_CACHE_MB` | `100` | 分片内存缓存大小（MB）。多台设备同看 4K 时可调大，如 `300` |
+| `YSP_CHANNELS_PATH` | 无 | 外部 `channels.yaml` 路径（需挂载进容器），用于追加 / 覆盖频道，修改后自动重新载入 |
 | `TZ` | `Asia/Shanghai` | 日志时区 |
 
 默认 26 路高码率频道：`cctv1`～`cctv5p`、`cctv7`～`cctv17`、`cctv4k`、`cctv8k`、`cctv164k`、`cgtn`、`cgtnfr`、`cgtnru`、`cgtnar`、`cgtnes`、`cgtndoc`。
@@ -122,6 +128,6 @@ cd /opt/ysp-live-docker && docker compose pull && docker compose up -d
 
 上游发布新版本时：
 
-1. 用上游的 `ysp-live.py`、`Dockerfile`、`README-DOCKER.md` 覆盖本仓库文件，单独提交一次「Update to upstream vX.Y」。
+1. 用上游的 `ysp-live.py`、`Dockerfile`、`README.md`（存为 `README-DOCKER.md`）覆盖本仓库文件（上游没有提供的文件保持不变），单独提交一次「Update to upstream vX.Y」。
 2. 重新应用本仓库对 `ysp-live.py` 的改动（可参考 `git log` 中上游提交之后的各次提交），确认 `python3 -m py_compile ysp-live.py` 通过。
 3. 推送后等 Actions 完成，在设备上执行更新命令。
