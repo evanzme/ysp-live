@@ -10,9 +10,12 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
-      # 每个设备获取几个 4K 链接后主动换新设备 (出现 HTTP 400 时可改为 3)
+      # 每个设备获取几个不同的高码率频道后切换到热备设备 (上游默认 6；实测单设备 4~13 个后被风控)
       - YSP_LINKS_PER_DEVICE=4
-      # 设备被封后连续失败几次换新设备 (兜底)
-      - YSP_IDENTITY_RESET_THRESHOLD=3
-      # 走 4K/高码率接口的频道，逗号分隔；不设置则为全部 26 个
-      # - YSP_HIGHRATE_CHANNELS=cctv4k,cctv8k,cctv164k,cctv5,cctv5p
+      # 只让 3 个真 4K/8K 频道走设备协议，其余走 1080p
+      # - YSP_ONLY_4K_DEVICE=1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

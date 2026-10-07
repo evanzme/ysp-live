@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-LABEL description="央视频全频道直播代理 v8.1（Python 主网关 + Node.js 网页版兜底引擎，单端口）"
+LABEL description="央视频全频道直播代理 v9.0（Python 主网关 + Node.js 网页版兜底引擎，单端口）"
 
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
